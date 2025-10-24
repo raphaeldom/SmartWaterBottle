@@ -1,10 +1,18 @@
-// AI-driven hydration planner with safe fallback.
-// Receives {ml, pct, cm} from ESP32; decides whether to notify and how much to drink now.
-// Uses OpenAI (gpt-4o-mini) *if* OPENAI_API_KEY is set; otherwise uses fallback rules.
+// api/ingest.js
+// AI-driven hydration planner with safe fallback, plus DEBUG info for quiet hours.
+// Sends Telegram messages when user is behind schedule or very low %.
+//
+// Env vars to set (Production):
+// BOT_TOKEN, CHAT_ID, NAME, AGE, WEIGHT_KG, HEIGHT_CM,
+// ACTIVITY_MON..SUN, WAKE_TIME, SLEEP_TIME,
+// QUIET_START_HOUR, QUIET_END_HOUR, MIN_INTERVAL_MIN,
+// (optional) CLINICIAN_LIMIT_ML, OPENAI_API_KEY
+//
+// DEBUG: request body may include "force": true to bypass quiet hours and rate limit.
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(v, hi));
 
-// Telegram helper (logs response on server for debugging)
+// Telegram helper (logs response for debugging)
 async function TG(token, method, body) {
   const url = `https://api.telegram.org/bot${token}/${method}`;
   const r = await fetch(url, {
@@ -17,32 +25,40 @@ async function TG(token, method, body) {
   return { status: r.status, text: txt };
 }
 
-// in-memory rate limit (resets on cold start; fine for prototype)
+// In-memory rate limiter (resets on cold start; fine for prototype)
 const lastNotified = new Map();
 
 function getConfig() {
-  const c = {
+  return {
     BOT_TOKEN: process.env.BOT_TOKEN,
     CHAT_ID:   process.env.CHAT_ID,
+
     NAME:      process.env.NAME || 'friend',
     AGE:       Number(process.env.AGE || 22),
     WEIGHT_KG: Number(process.env.WEIGHT_KG || 70),
     HEIGHT_CM: Number(process.env.HEIGHT_CM || 170),
-    ACT_MON:   process.env.ACTIVITY_MON || 'Moderate',
-    ACT_TUE:   process.env.ACTIVITY_TUE || 'Moderate',
-    ACT_WED:   process.env.ACTIVITY_WED || 'Moderate',
-    ACT_THU:   process.env.ACTIVITY_THU || 'Moderate',
-    ACT_FRI:   process.env.ACTIVITY_FRI || 'Moderate',
-    ACT_SAT:   process.env.ACTIVITY_SAT || 'Light',
-    ACT_SUN:   process.env.ACTIVITY_SUN || 'Light',
-    WAKE_TIME: process.env.WAKE_TIME  || '07:00',
-    SLEEP_TIME:process.env.SLEEP_TIME || '23:00',
-    QUIET_START: Number(process.env.QUIET_START_HOUR || 23), // UTC hours
+
+    ACT_MON: process.env.ACTIVITY_MON || 'Moderate',
+    ACT_TUE: process.env.ACTIVITY_TUE || 'Moderate',
+    ACT_WED: process.env.ACTIVITY_WED || 'Moderate',
+    ACT_THU: process.env.ACTIVITY_THU || 'Moderate',
+    ACT_FRI: process.env.ACTIVITY_FRI || 'Moderate',
+    ACT_SAT: process.env.ACTIVITY_SAT || 'Light',
+    ACT_SUN: process.env.ACTIVITY_SUN || 'Light',
+
+    WAKE_TIME:  process.env.WAKE_TIME  || '07:00',
+    SLEEP_TIME: process.env.SLEEP_TIME || '23:00',
+
+    // Note: UTC hours on Vercel!
+    QUIET_START: Number(process.env.QUIET_START_HOUR || 23),
     QUIET_END:   Number(process.env.QUIET_END_HOUR   || 7),
+
     MIN_INTERVAL_MIN: Number(process.env.MIN_INTERVAL_MIN || 30),
-    CLINICIAN_LIMIT_ML: process.env.CLINICIAN_LIMIT_ML != null ? Number(process.env.CLINICIAN_LIMIT_ML) : null
+
+    CLINICIAN_LIMIT_ML: process.env.CLINICIAN_LIMIT_ML != null
+      ? Number(process.env.CLINICIAN_LIMIT_ML)
+      : null
   };
-  return c;
 }
 
 function normalizeActivity(s=''){
@@ -65,7 +81,7 @@ function parseHM(s, defH=7, defM=0){
   const d = new Date(now); d.setHours(h, mm, 0, 0); return d;
 }
 
-// ------- Fallback plan if AI not available -------
+// ------- Fallback plan (used if no OPENAI_API_KEY or AI fails) -------
 function fallbackPlan({ weight_kg, activity, wakeStr='07:00', sleepStr='23:00' }, mlNow, pctNow, now){
   let goal = Math.round(35 * weight_kg);
   goal += { Sedentary:0, Light:400, Moderate:800, Heavy:1200 }[activity] ?? 400;
@@ -95,7 +111,7 @@ function fallbackPlan({ weight_kg, activity, wakeStr='07:00', sleepStr='23:00' }
   return { goal_ml: goal, target_ml_now: targetByNow, remaining_ml: remaining, next_sip_ml, should_notify: shouldNotify, reason: 'fallback schedule' };
 }
 
-// ------- AI planner (if OPENAI_API_KEY set) -------
+// ------- AI planner (optional) -------
 async function aiPlan(openaiKey, ctx, reading) {
   const url = 'https://api.openai.com/v1/chat/completions';
   const body = {
@@ -126,8 +142,8 @@ Return ONLY JSON with keys: daily_goal_ml, target_ml_by_now, should_notify, next
 
   const txt = r?.choices?.[0]?.message?.content;
   if (!txt) throw new Error('no_ai_output');
-
   const data = JSON.parse(txt);
+
   const goal   = clamp(Math.round(Number(data.daily_goal_ml || 0)), 800, 6000);
   const target = clamp(Math.round(Number(data.target_ml_by_now || 0)), 0, goal);
   const sip    = clamp(Math.round(Number(data.next_sip_ml || 0)), 120, 300);
@@ -142,26 +158,40 @@ export default async function handler(req, res) {
 
   try {
     const cfg = getConfig();
-    if (!cfg.BOT_TOKEN || !cfg.CHAT_ID) return res.status(500).json({ error: 'missing BOT_TOKEN/CHAT_ID' });
-
-    // parse JSON body
-    const body = typeof req.body === 'object' && req.body ? req.body : JSON.parse(await streamToString(req));
-    const { ml, pct, cm } = body || {};
-    if (ml == null || pct == null) return res.status(400).json({ error: 'missing ml/pct' });
-
-    // quiet hours in UTC
-    const now = new Date();
-    const hour = now.getHours();
-    if (hour >= cfg.QUIET_START || hour < cfg.QUIET_END) {
-      return res.json({ ok: true, skipped: 'quiet_hours' });
+    if (!cfg.BOT_TOKEN || !cfg.CHAT_ID) {
+      return res.status(500).json({ error: 'missing BOT_TOKEN/CHAT_ID' });
     }
 
-    // rate limit
+    // Parse JSON body
+    const body = typeof req.body === 'object' && req.body ? req.body : JSON.parse(await streamToString(req));
+    const { ml, pct, cm } = body || {};
+    if (ml == null || pct == null) {
+      return res.status(400).json({ error: 'missing ml/pct' });
+    }
+
+    // --- FORCE BYPASS for testing (set force:true in body or DEBUG_BYPASS=1 in env) ---
+    const force = (body && (body.force === true || body.force === 1)) || process.env.DEBUG_BYPASS === '1';
+
+    // Quiet hours check (UTC) WITH DEBUG FIELDS
+    const now = new Date();
+    const hour = now.getHours(); // 0..23 UTC on Vercel
+    if (!force && (hour >= cfg.QUIET_START || hour < cfg.QUIET_END)) {
+      return res.json({
+        ok: true,
+        skipped: 'quiet_hours',
+        serverHourUTC: hour,
+        quietStartUTC: cfg.QUIET_START,
+        quietEndUTC: cfg.QUIET_END
+      });
+    }
+
+    // Rate limit
     const last = lastNotified.get(cfg.CHAT_ID) || 0;
-    if (Date.now() - last < cfg.MIN_INTERVAL_MIN * 60 * 1000) {
+    if (!force && Date.now() - last < (cfg.MIN_INTERVAL_MIN * 60 * 1000)) {
       return res.json({ ok: true, skipped: 'interval' });
     }
 
+    // Build today's context
     const dow = new Date().getDay(); // 0=Sun..6=Sat
     const dayAct = {
       1: cfg.ACT_MON, 2: cfg.ACT_TUE, 3: cfg.ACT_WED, 4: cfg.ACT_THU, 5: cfg.ACT_FRI, 6: cfg.ACT_SAT, 0: cfg.ACT_SUN
@@ -174,16 +204,23 @@ export default async function handler(req, res) {
     };
     const reading = { ml_now: ml, pct_now: pct, cm_now: cm };
 
-    // pick AI or fallback
+    // Choose AI or fallback
     let plan;
     if (process.env.OPENAI_API_KEY) {
-      try { plan = await aiPlan(process.env.OPENAI_API_KEY, ctx, reading); }
-      catch (e) {
+      try {
+        plan = await aiPlan(process.env.OPENAI_API_KEY, ctx, reading);
+      } catch (e) {
         console.log('AI error, using fallback:', String(e));
-        plan = fallbackPlan({ weight_kg: cfg.WEIGHT_KG, activity: normalizeActivity(dayAct), wakeStr: cfg.WAKE_TIME, sleepStr: cfg.SLEEP_TIME }, ml, pct, now);
+        plan = fallbackPlan(
+          { weight_kg: cfg.WEIGHT_KG, activity: normalizeActivity(dayAct), wakeStr: cfg.WAKE_TIME, sleepStr: cfg.SLEEP_TIME },
+          ml, pct, now
+        );
       }
     } else {
-      plan = fallbackPlan({ weight_kg: cfg.WEIGHT_KG, activity: normalizeActivity(dayAct), wakeStr: cfg.WAKE_TIME, sleepStr: cfg.SLEEP_TIME }, ml, pct, now);
+      plan = fallbackPlan(
+        { weight_kg: cfg.WEIGHT_KG, activity: normalizeActivity(dayAct), wakeStr: cfg.WAKE_TIME, sleepStr: cfg.SLEEP_TIME },
+        ml, pct, now
+      );
     }
 
     const remaining_ml = Math.max(0, plan.goal_ml - ml);
